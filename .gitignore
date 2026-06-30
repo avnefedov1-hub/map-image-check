@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+dist_folder/
+dist_installer/
+dist_onefile/
+*.zip
+build_assets/*.exe
+
+# Local runtime data
+*.sqlite3
+*.joblib
+map_scan_results.csv
+map_classifier_meta.json
+
+# Secrets
+.env
+email_sender/config.py
+
+# IDE / tools
+.cursor/
