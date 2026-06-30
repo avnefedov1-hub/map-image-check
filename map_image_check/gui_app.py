@@ -44,18 +44,27 @@ from .image_store import (
     ML_FILTER_ALL,
     ML_FILTER_GT90,
     ML_FILTER_RANGE_80_90,
+    LLM_FILTER_ALL,
+    LLM_FILTER_NO,
+    LLM_FILTER_UNKNOWN,
+    LLM_FILTER_YES,
     StoredImageRecord,
     format_data_size,
+    list_records_needing_llm_analysis,
     lookup_path_in_index,
+    matches_llm_topographic_filter,
     matches_ml_score_filter,
     parse_feature_summary,
+    record_has_llm_analysis,
+    record_llm_is_topographic_map,
     record_ml_score,
 )
 from .llm_analysis import (
     DEFAULT_LOCAL_MODEL,
     DEFAULT_OLLAMA_BASE,
     analyze_image_with_local_llm,
-    classify_map_yes_no,
+    build_gray_zone_llm_result,
+    classify_map_yes_no_with_response,
     format_health_check_message,
     normalize_ollama_base_url,
     ollama_health_check,
@@ -81,6 +90,12 @@ _DB_ML_FILTER_LABELS = {
     ML_FILTER_ALL: "Все ML",
     ML_FILTER_GT90: "ML > 90%",
     ML_FILTER_RANGE_80_90: "ML 80–90%",
+}
+_DB_LLM_FILTER_LABELS = {
+    LLM_FILTER_ALL: "Все LLM",
+    LLM_FILTER_YES: "LLM: карта",
+    LLM_FILTER_NO: "LLM: не карта",
+    LLM_FILTER_UNKNOWN: "LLM: не проверено",
 }
 _THEME_PALETTES = {
     "light": {
@@ -118,7 +133,10 @@ class MapScannerGui(tk.Tk):
 
         self._event_queue: queue.Queue[tuple] = queue.Queue()
         self._scan_thread: threading.Thread | None = None
+        self._llm_single_thread: threading.Thread | None = None
+        self._llm_batch_thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
+        self._llm_batch_stop_requested = threading.Event()
         self._found_paths: list[str] = []
         self._folder_paths: list[str] = []
         self._ad_computers: list[str] = []
@@ -172,6 +190,8 @@ class MapScannerGui(tk.Tk):
         )
         self._db_host_filter_var = tk.StringVar(value=_DB_FILTER_ALL)
         self._db_ml_filter_var = tk.StringVar(value=ML_FILTER_ALL)
+        self._db_llm_filter_var = tk.StringVar(value=LLM_FILTER_ALL)
+        self._progress_text_var = tk.StringVar(value="")
 
         self._configure_styles()
         self._build_menu()
@@ -180,6 +200,7 @@ class MapScannerGui(tk.Tk):
         self._update_mode_summary()
         self.after(100, self._poll_events)
         self.after(200, self._maybe_load_database_on_startup)
+        self._update_llm_buttons_state()
 
     def _configure_styles(self) -> None:
         palette = _THEME_PALETTES[self._theme_name]
@@ -485,6 +506,20 @@ class MapScannerGui(tk.Tk):
                 command=self._apply_db_filters,
                 style="TRadiobutton",
             ).grid(row=0, column=column + 1, sticky="w", padx=(0, 12))
+        llm_row = ttk.Frame(self._db_filter_frame, style="Card.TFrame")
+        llm_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(llm_row, text="LLM", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        for column, (mode, label) in enumerate(_DB_LLM_FILTER_LABELS.items()):
+            ttk.Radiobutton(
+                llm_row,
+                text=label,
+                value=mode,
+                variable=self._db_llm_filter_var,
+                command=self._apply_db_filters,
+                style="TRadiobutton",
+            ).grid(row=0, column=column + 1, sticky="w", padx=(0, 12))
         self._db_filter_frame.grid_remove()
 
         list_frame = ttk.Frame(results_card, style="Card.TFrame")
@@ -618,9 +653,18 @@ class MapScannerGui(tk.Tk):
         )
         self._run_llm_button.grid(row=1, column=2, padx=(10, 0), sticky="e", pady=(8, 0))
         self._run_llm_button.state(["disabled"])
+        self._run_llm_batch_button = ttk.Button(
+            llm_controls,
+            text="Проанализировать все в БД",
+            command=self._start_llm_batch_analysis,
+            style="Secondary.TButton",
+        )
+        self._run_llm_batch_button.grid(
+            row=1, column=3, padx=(10, 0), sticky="e", pady=(8, 0)
+        )
         ttk.Label(
             llm_controls, textvariable=self._llm_status_var, style="Card.TLabel"
-        ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         analysis_frame = ttk.Frame(llm_tab, style="Card.TFrame")
         analysis_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
@@ -663,10 +707,16 @@ class MapScannerGui(tk.Tk):
             mode="indeterminate",
             style="Modern.Horizontal.TProgressbar",
         )
-        self._progressbar.grid(row=0, column=2, sticky="ew", padx=(0, 16))
+        self._progressbar.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        ttk.Label(
+            footer,
+            textvariable=self._progress_text_var,
+            style="Card.TLabel",
+            width=14,
+        ).grid(row=0, column=3, sticky="e", padx=(0, 16))
 
         count_box = ttk.Frame(footer, style="Card.TFrame")
-        count_box.grid(row=0, column=3, sticky="e")
+        count_box.grid(row=0, column=4, sticky="e")
         ttk.Label(
             count_box, text="Найдено карт", style="MetricCaption.TLabel"
         ).grid(row=0, column=0, sticky="e")
@@ -748,18 +798,75 @@ class MapScannerGui(tk.Tk):
             return [Path(path) for path in self._folder_paths]
         return build_unc_roots(self._selected_ad_computers(), self._selected_remote_shares())
 
+    def _reset_progressbar(self) -> None:
+        self._progressbar.stop()
+        self._progressbar.configure(mode="indeterminate", maximum=100, value=0)
+        self._progress_text_var.set("")
+
+    def _set_progress_indeterminate(self) -> None:
+        self._progressbar.stop()
+        self._progressbar.configure(mode="indeterminate", maximum=100, value=0)
+        self._progress_text_var.set("")
+        self._progressbar.start(12)
+
+    def _set_progress_determinate(self, current: int, total: int) -> None:
+        self._progressbar.stop()
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        self._progressbar.configure(mode="determinate", maximum=total, value=current)
+        percent = int(round(100 * current / total))
+        self._progress_text_var.set(f"{current} / {total} ({percent}%)")
+
+    def _scan_running(self) -> bool:
+        return self._scan_thread is not None and self._scan_thread.is_alive()
+
+    def _llm_task_running(self) -> bool:
+        single = self._llm_single_thread is not None and self._llm_single_thread.is_alive()
+        batch = self._llm_batch_thread is not None and self._llm_batch_thread.is_alive()
+        return single or batch
+
+    def _update_llm_buttons_state(self) -> None:
+        busy = self._scan_running() or self._llm_task_running()
+        if self._selected_record is None or busy:
+            self._run_llm_button.state(["disabled"])
+        else:
+            self._run_llm_button.state(["!disabled"])
+        if busy or self._image_store.count_images() == 0:
+            self._run_llm_batch_button.state(["disabled"])
+        else:
+            self._run_llm_batch_button.state(["!disabled"])
+
     def _set_scan_running_state(self, is_running: bool) -> None:
         if is_running:
             self._start_button.state(["disabled"])
             self._stop_button.state(["!disabled"])
-            self._progressbar.start(12)
+            self._set_progress_indeterminate()
         else:
             self._start_button.state(["!disabled"])
             self._stop_button.state(["disabled"])
-            self._progressbar.stop()
+            if not (self._llm_batch_thread and self._llm_batch_thread.is_alive()):
+                self._reset_progressbar()
+        self._update_llm_buttons_state()
+
+    def _set_llm_batch_running_state(self, is_running: bool) -> None:
+        if is_running:
+            self._start_button.state(["disabled"])
+            self._stop_button.state(["!disabled"])
+        else:
+            self._start_button.state(["!disabled"])
+            if not self._scan_running():
+                self._stop_button.state(["disabled"])
+            self._reset_progressbar()
+        self._update_llm_buttons_state()
 
     def _start_scan(self) -> None:
-        if self._scan_thread and self._scan_thread.is_alive():
+        if self._scan_running():
+            return
+        if self._llm_task_running():
+            messagebox.showinfo(
+                APP_NAME,
+                "Дождитесь завершения или остановите текущий LLM-анализ.",
+            )
             return
 
         roots = self._selected_roots()
@@ -810,7 +917,7 @@ class MapScannerGui(tk.Tk):
         self._db_status_var.set(self._db_status_text())
         self._llm_status_var.set("LLM-анализ еще не выполнялся.")
         self._set_analysis_text("Подробный LLM-анализ будет показан здесь.")
-        self._run_llm_button.state(["disabled"])
+        self._update_llm_buttons_state()
         self._status_var.set("Сканирование...")
         self._set_scan_running_state(True)
 
@@ -822,7 +929,12 @@ class MapScannerGui(tk.Tk):
         self._scan_thread.start()
 
     def _stop_scan(self) -> None:
-        if not self._scan_thread or not self._scan_thread.is_alive():
+        if self._llm_batch_thread and self._llm_batch_thread.is_alive():
+            self._llm_batch_stop_requested.set()
+            self._status_var.set("Остановка пакетного LLM-анализа...")
+            self._stop_button.state(["disabled"])
+            return
+        if not self._scan_running():
             return
         self._stop_requested.set()
         self._status_var.set("Остановка сканирования...")
@@ -845,8 +957,8 @@ class MapScannerGui(tk.Tk):
         ml_classifier = self._ml_classifier
         path_index = self._image_store.build_path_index()
 
-        def llm_classify(image_bytes: bytes) -> bool:
-            return classify_map_yes_no(
+        def llm_classify(image_bytes: bytes) -> tuple[bool, str]:
+            return classify_map_yes_no_with_response(
                 image_bytes=image_bytes,
                 model_name=llm_model,
                 base_url=llm_base_url,
@@ -921,6 +1033,25 @@ class MapScannerGui(tk.Tk):
                             self._image_store.add_path_to_index(
                                 path_index, fp, saved.record.image_id
                             )
+                            if decision.decision_source == "llm":
+                                llm_payload = build_gray_zone_llm_result(
+                                    model_name=llm_model,
+                                    llm_verdict=bool(decision.llm_verdict),
+                                    llm_response_text=decision.llm_response_text,
+                                    ml_score=decision.ml_score,
+                                    heuristic_score=decision.heuristic_score,
+                                )
+                                self._image_store.update_llm_result(
+                                    saved.record.image_id,
+                                    status=str(llm_payload["status"]),
+                                    model_name=str(llm_payload["model_name"]),
+                                    prompt_version=str(llm_payload["prompt_version"]),
+                                    analysis_text=str(llm_payload["analysis_text"]),
+                                    structured_json=llm_payload.get("structured_json"),
+                                    is_topographic_map=bool(
+                                        llm_payload.get("is_topographic_map")
+                                    ),
+                                )
                         if classified % _PROGRESS_EVERY == 0:
                             self._event_queue.put(
                                 ("progress", classified, maps, skipped, skipped_in_db)
@@ -1000,28 +1131,97 @@ class MapScannerGui(tk.Tk):
                     self._set_scan_running_state(False)
                     messagebox.showerror(APP_NAME, event[1])
                 elif kind == "llm_started":
-                    self._run_llm_button.state(["disabled"])
+                    self._update_llm_buttons_state()
                     self._focus_llm_tab()
                     self._llm_status_var.set(
                         f"LLM-анализ запущен для модели {event[1]}..."
                     )
                 elif kind == "llm_finished":
                     image_id = int(event[1])
-                    self._run_llm_button.state(["!disabled"])
                     self._focus_llm_tab()
+                    self._sync_db_record_cache(image_id)
                     if self._selected_record and self._selected_record.image_id == image_id:
                         self._load_selected_record(image_id)
                     else:
                         self._llm_status_var.set("LLM-анализ завершен.")
+                        self._update_llm_buttons_state()
                 elif kind == "llm_failed":
                     image_id, message = int(event[1]), event[2]
-                    self._run_llm_button.state(["!disabled"])
+                    self._sync_db_record_cache(image_id)
                     if self._selected_record and self._selected_record.image_id == image_id:
                         self._load_selected_record(image_id)
+                    else:
+                        self._update_llm_buttons_state()
                     self._llm_status_var.set(f"Ошибка LLM-анализа: {message}")
+                elif kind == "llm_worker_idle":
+                    self._update_llm_buttons_state()
                 elif kind == "ollama_check":
                     self._check_ollama_button.state(["!disabled"])
                     self._llm_status_var.set(str(event[1]))
+                elif kind == "llm_batch_started":
+                    total, model_name = int(event[1]), str(event[2])
+                    self._set_llm_batch_running_state(True)
+                    self._set_progress_determinate(0, total)
+                    self._llm_status_var.set(
+                        f"Пакетный LLM-анализ: 0/{total}, модель {model_name}..."
+                    )
+                    self._status_var.set(
+                        f"Пакетный LLM-анализ: 0 из {total} изображений..."
+                    )
+                elif kind == "llm_batch_progress":
+                    processed, total, image_id = int(event[1]), int(event[2]), int(event[3])
+                    index = int(event[4]) if len(event) > 4 else min(processed + 1, total)
+                    self._set_progress_determinate(processed, total)
+                    self._llm_status_var.set(
+                        f"Пакетный LLM-анализ: обрабатывается {index}/{total} "
+                        f"(id={image_id}), готово {processed}..."
+                    )
+                    self._status_var.set(
+                        f"Пакетный LLM-анализ: {processed} из {total} завершено, "
+                        f"идёт {index}-е изображение..."
+                    )
+                elif kind == "llm_batch_item_done":
+                    image_id = int(event[1])
+                    processed = int(event[2]) if len(event) > 2 else 0
+                    total = int(event[3]) if len(event) > 3 else processed
+                    self._set_progress_determinate(processed, total)
+                    self._sync_db_record_cache(image_id)
+                    if self._selected_record and self._selected_record.image_id == image_id:
+                        self._load_selected_record(image_id)
+                elif kind == "llm_batch_stopped":
+                    done, failed, total = int(event[1]), int(event[2]), int(event[3])
+                    processed = done + failed
+                    self._set_progress_determinate(processed, total)
+                    self._set_llm_batch_running_state(False)
+                    self._llm_batch_thread = None
+                    self._status_var.set(
+                        f"Пакетный LLM-анализ остановлен. "
+                        f"Готово: {done}, ошибок: {failed}, всего: {total}."
+                    )
+                    if self._viewing_database:
+                        self._reload_database_records()
+                elif kind == "llm_batch_done":
+                    done, failed, skipped, total = (
+                        int(event[1]),
+                        int(event[2]),
+                        int(event[3]),
+                        int(event[4]),
+                    )
+                    pending_total = done + failed
+                    if pending_total > 0:
+                        self._set_progress_determinate(pending_total, pending_total)
+                    self._set_llm_batch_running_state(False)
+                    self._llm_batch_thread = None
+                    self._status_var.set(
+                        f"Пакетный LLM-анализ завершён. "
+                        f"Готово: {done}, ошибок: {failed}, "
+                        f"пропущено (уже были): {skipped}, всего в БД: {total}."
+                    )
+                    self._llm_status_var.set(
+                        f"Пакетный анализ завершён: {done} новых, {failed} ошибок."
+                    )
+                    if self._viewing_database:
+                        self._reload_database_records()
         except queue.Empty:
             pass
         self.after(100, self._poll_events)
@@ -1111,7 +1311,14 @@ class MapScannerGui(tk.Tk):
             f"heuristic={record.score:.2f}" if record.score is not None else "heuristic=—"
         )
         ml_part = f", ml={ml_score:.2f}" if ml_score is not None else ", ml=—"
-        return f"{heuristic_part}{ml_part}, verdict={verdict}, source={source}"
+        llm_topo = record.llm_is_topographic_map
+        if llm_topo is True:
+            llm_part = ", llm=карта"
+        elif llm_topo is False:
+            llm_part = ", llm=не карта"
+        else:
+            llm_part = ", llm=—"
+        return f"{heuristic_part}{ml_part}{llm_part}, verdict={verdict}, source={source}"
 
     def _label_stats_text(self) -> str:
         maps, not_maps = self._image_store.get_label_stats()
@@ -1192,7 +1399,7 @@ class MapScannerGui(tk.Tk):
         self._update_label_controls(None)
         self._llm_status_var.set("LLM-анализ еще не выполнялся.")
         self._set_analysis_text("Подробный LLM-анализ будет показан здесь.")
-        self._run_llm_button.state(["disabled"])
+        self._update_llm_buttons_state()
 
     def _remove_list_item_at(self, index: int) -> None:
         if index < 0 or index >= len(self._found_paths):
@@ -1209,6 +1416,7 @@ class MapScannerGui(tk.Tk):
             self._db_filter_frame.grid_remove()
             self._db_host_filter_var.set(_DB_FILTER_ALL)
             self._db_ml_filter_var.set(ML_FILTER_ALL)
+            self._db_llm_filter_var.set(LLM_FILTER_ALL)
 
     def _format_db_list_item(
         self,
@@ -1219,7 +1427,14 @@ class MapScannerGui(tk.Tk):
         name = Path(record.source_path).name
         ml = record_ml_score(record)
         ml_part = f"  ml={ml * 100:.0f}%" if ml is not None else ""
-        line = f"{name}  [#{record.image_id}]{ml_part}"
+        llm_topo = record_llm_is_topographic_map(record)
+        if llm_topo is True:
+            llm_part = "  llm=да"
+        elif llm_topo is False:
+            llm_part = "  llm=нет"
+        else:
+            llm_part = ""
+        line = f"{name}  [#{record.image_id}]{ml_part}{llm_part}"
         if show_host:
             host = record.source_host or _DB_FILTER_LOCAL_LABEL
             return f"{host}: {line}"
@@ -1269,9 +1484,26 @@ class MapScannerGui(tk.Tk):
             if matches_ml_score_filter(record_ml_score(record), filter_mode=mode)
         ]
 
+    def _db_records_for_current_llm_filter(
+        self,
+        records: list[StoredImageRecord],
+    ) -> list[StoredImageRecord]:
+        mode = self._db_llm_filter_var.get().strip()
+        if mode in ("", LLM_FILTER_ALL):
+            return records
+        return [
+            record
+            for record in records
+            if matches_llm_topographic_filter(
+                record_llm_is_topographic_map(record),
+                filter_mode=mode,
+            )
+        ]
+
     def _db_records_for_current_filters(self) -> list[StoredImageRecord]:
         records = self._db_records_for_current_host_filter()
-        return self._db_records_for_current_ml_filter(records)
+        records = self._db_records_for_current_ml_filter(records)
+        return self._db_records_for_current_llm_filter(records)
 
     def _active_db_filter_labels(self) -> list[str]:
         labels: list[str] = []
@@ -1281,6 +1513,9 @@ class MapScannerGui(tk.Tk):
         ml_mode = self._db_ml_filter_var.get().strip()
         if ml_mode and ml_mode != ML_FILTER_ALL:
             labels.append(_DB_ML_FILTER_LABELS.get(ml_mode, ml_mode))
+        llm_mode = self._db_llm_filter_var.get().strip()
+        if llm_mode and llm_mode != LLM_FILTER_ALL:
+            labels.append(_DB_LLM_FILTER_LABELS.get(llm_mode, llm_mode))
         return labels
 
     def _rebuild_db_host_filter_choices(self) -> None:
@@ -1337,6 +1572,15 @@ class MapScannerGui(tk.Tk):
     def _on_db_host_filter_changed(self, _event: object = None) -> None:
         self._apply_db_filters()
 
+    def _reload_database_records(self) -> None:
+        try:
+            self._db_all_records = self._image_store.list_image_records()
+        except Exception:
+            return
+        self._rebuild_db_host_filter_choices()
+        self._apply_db_filters()
+        self._db_status_var.set(self._db_status_text(self._selected_record))
+
     def _maybe_load_database_on_startup(self) -> None:
         if self._scan_thread and self._scan_thread.is_alive():
             return
@@ -1375,8 +1619,10 @@ class MapScannerGui(tk.Tk):
         self._rebuild_db_host_filter_choices()
         self._db_host_filter_var.set(_DB_FILTER_ALL)
         self._db_ml_filter_var.set(ML_FILTER_ALL)
+        self._db_llm_filter_var.set(LLM_FILTER_ALL)
         self._apply_db_filters()
         self._db_status_var.set(self._db_status_text())
+        self._update_llm_buttons_state()
 
     def _delete_selected_from_db(self) -> None:
         if self._scan_thread and self._scan_thread.is_alive():
@@ -1490,6 +1736,18 @@ class MapScannerGui(tk.Tk):
         if image_id is not None:
             self._load_selected_record(image_id)
 
+    def _sync_db_record_cache(self, image_id: int) -> None:
+        try:
+            record = self._image_store.get_image_record(image_id)
+        except KeyError:
+            return
+        for index, cached in enumerate(self._db_all_records):
+            if cached.image_id == image_id:
+                self._db_all_records[index] = record
+                break
+        if self._selected_record and self._selected_record.image_id == image_id:
+            self._selected_record = record
+
     def _load_selected_record(self, image_id: int) -> None:
         try:
             record = self._image_store.get_image_record(image_id)
@@ -1506,9 +1764,15 @@ class MapScannerGui(tk.Tk):
         self._db_status_var.set(self._db_status_text(record))
         self._update_label_controls(record)
         llm_status = record.llm_status or "нет подробного анализа"
+        topo_text = ""
+        if record.llm_is_topographic_map is True:
+            topo_text = ", топографическая карта: да"
+        elif record.llm_is_topographic_map is False:
+            topo_text = ", топографическая карта: нет"
         self._llm_status_var.set(
             f"LLM-статус: {llm_status}"
             + (f", модель: {record.llm_model_name}" if record.llm_model_name else "")
+            + topo_text
         )
         text = record.llm_analysis_text or (
             "Подробный LLM-анализ еще не выполнялся.\n\n"
@@ -1516,7 +1780,7 @@ class MapScannerGui(tk.Tk):
             f"Features: {record.feature_summary_json}"
         )
         self._set_analysis_text(text)
-        self._run_llm_button.state(["!disabled"])
+        self._update_llm_buttons_state()
 
     def _set_analysis_text(self, text: str) -> None:
         self._analysis_text.configure(state="normal")
@@ -1542,45 +1806,177 @@ class MapScannerGui(tk.Tk):
         if self._selected_record is None:
             messagebox.showinfo(APP_NAME, "Сначала выберите изображение из списка.")
             return
+        if self._scan_running() or self._llm_task_running():
+            messagebox.showinfo(
+                APP_NAME,
+                "Дождитесь завершения текущей фоновой задачи.",
+            )
+            return
+        if record_has_llm_analysis(self._selected_record):
+            if not messagebox.askyesno(
+                APP_NAME,
+                "Это изображение уже проанализировано LLM.\n"
+                "Запустить повторный анализ?",
+            ):
+                return
         model_name = self._llm_model_var.get().strip() or DEFAULT_LOCAL_MODEL
         base_url = self._ollama_base_url()
         self._llm_endpoint_var.set(base_url)
-        self._run_llm_button.state(["disabled"])
-        thread = threading.Thread(
+        self._update_llm_buttons_state()
+        self._llm_single_thread = threading.Thread(
             target=self._run_llm_analysis_worker,
             args=(self._selected_record.image_id, model_name, base_url),
             daemon=True,
         )
-        thread.start()
+        self._llm_single_thread.start()
+
+    def _start_llm_batch_analysis(self) -> None:
+        if self._scan_running() or self._llm_task_running():
+            messagebox.showinfo(
+                APP_NAME,
+                "Дождитесь завершения текущей фоновой задачи.",
+            )
+            return
+        try:
+            all_records = self._image_store.list_image_records()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Не удалось загрузить базу данных:\n{exc}")
+            return
+        if not all_records:
+            messagebox.showinfo(APP_NAME, "База данных пуста.")
+            return
+        pending = list_records_needing_llm_analysis(all_records)
+        if not pending:
+            messagebox.showinfo(
+                APP_NAME,
+                "Все изображения в базе уже проанализированы LLM.",
+            )
+            return
+        model_name = self._llm_model_var.get().strip() or DEFAULT_LOCAL_MODEL
+        base_url = self._ollama_base_url()
+        self._llm_endpoint_var.set(base_url)
+        prompt = (
+            f"Проанализировать {len(pending)} из {len(all_records)} изображений "
+            f"моделью «{model_name}»?\n\n"
+            f"Уже проанализированные ({len(all_records) - len(pending)}) будут пропущены."
+        )
+        if not messagebox.askyesno(APP_NAME, prompt):
+            return
+        self._llm_batch_stop_requested.clear()
+        image_ids = [record.image_id for record in pending]
+        self._llm_batch_thread = threading.Thread(
+            target=self._run_llm_batch_worker,
+            args=(image_ids, len(all_records), len(all_records) - len(pending), model_name, base_url),
+            daemon=True,
+        )
+        self._set_llm_batch_running_state(True)
+        self._event_queue.put(("llm_batch_started", len(pending), model_name))
+        self._llm_batch_thread.start()
+
+    def _analyze_image_with_llm(
+        self,
+        image_id: int,
+        *,
+        model_name: str,
+        base_url: str,
+    ) -> None:
+        record = self._image_store.get_image_record(image_id)
+        image_bytes = self._image_store.get_image_bytes(image_id)
+        is_topographic_map, _yes_no_text = classify_map_yes_no_with_response(
+            image_bytes=image_bytes,
+            model_name=model_name,
+            base_url=base_url,
+        )
+        self._image_store.update_llm_result(
+            image_id,
+            status="running",
+            model_name=model_name,
+            prompt_version=None,
+            analysis_text=None,
+            structured_json=None,
+            is_topographic_map=is_topographic_map,
+        )
+        result = analyze_image_with_local_llm(
+            image_bytes=image_bytes,
+            record=record,
+            model_name=model_name,
+            base_url=base_url,
+        )
+        self._image_store.update_llm_result(
+            image_id,
+            status=str(result["status"]),
+            model_name=str(result["model_name"]),
+            prompt_version=str(result["prompt_version"]),
+            analysis_text=str(result["analysis_text"]),
+            structured_json=result.get("structured_json"),
+            is_topographic_map=is_topographic_map,
+        )
+
+    def _run_llm_batch_worker(
+        self,
+        image_ids: list[int],
+        total_in_db: int,
+        already_analyzed: int,
+        model_name: str,
+        base_url: str,
+    ) -> None:
+        done = 0
+        failed = 0
+        total = len(image_ids)
+        try:
+            for index, image_id in enumerate(image_ids, start=1):
+                if self._llm_batch_stop_requested.is_set():
+                    self._event_queue.put(("llm_batch_stopped", done, failed, total))
+                    return
+                processed = done + failed
+                self._event_queue.put(
+                    ("llm_batch_progress", processed, total, image_id, index)
+                )
+                try:
+                    record = self._image_store.get_image_record(image_id)
+                    if record_has_llm_analysis(record):
+                        continue
+                    self._analyze_image_with_llm(
+                        image_id,
+                        model_name=model_name,
+                        base_url=base_url,
+                    )
+                    done += 1
+                except Exception as exc:
+                    failed += 1
+                    try:
+                        self._image_store.update_llm_result(
+                            image_id,
+                            status="failed",
+                            model_name=model_name,
+                            prompt_version=None,
+                            analysis_text=str(exc),
+                            structured_json=None,
+                        )
+                    except KeyError:
+                        pass
+                processed = done + failed
+                self._event_queue.put(
+                    ("llm_batch_item_done", image_id, processed, total)
+                )
+            self._event_queue.put(
+                ("llm_batch_done", done, failed, already_analyzed, total_in_db)
+            )
+        except Exception as exc:
+            self._event_queue.put(
+                ("llm_batch_done", done, failed, already_analyzed, total_in_db)
+            )
+            self._event_queue.put(("error", str(exc)))
 
     def _run_llm_analysis_worker(
         self, image_id: int, model_name: str, base_url: str
     ) -> None:
         self._event_queue.put(("llm_started", model_name))
         try:
-            record = self._image_store.get_image_record(image_id)
-            image_bytes = self._image_store.get_image_bytes(image_id)
-            self._image_store.update_llm_result(
+            self._analyze_image_with_llm(
                 image_id,
-                status="running",
-                model_name=model_name,
-                prompt_version=None,
-                analysis_text=None,
-                structured_json=None,
-            )
-            result = analyze_image_with_local_llm(
-                image_bytes=image_bytes,
-                record=record,
                 model_name=model_name,
                 base_url=base_url,
-            )
-            self._image_store.update_llm_result(
-                image_id,
-                status=str(result["status"]),
-                model_name=str(result["model_name"]),
-                prompt_version=str(result["prompt_version"]),
-                analysis_text=str(result["analysis_text"]),
-                structured_json=result.get("structured_json"),
             )
             self._event_queue.put(("llm_finished", image_id))
         except Exception as exc:
@@ -1593,6 +1989,9 @@ class MapScannerGui(tk.Tk):
                 structured_json=None,
             )
             self._event_queue.put(("llm_failed", image_id, str(exc)))
+        finally:
+            self._llm_single_thread = None
+            self._event_queue.put(("llm_worker_idle",))
 
     def _show_preview(self, path: Path, *, image_id: int | None = None) -> None:
         self._preview_path = path

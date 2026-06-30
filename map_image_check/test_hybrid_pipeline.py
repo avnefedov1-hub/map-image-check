@@ -14,8 +14,15 @@ from map_image_check.hybrid_pipeline import HybridConfig, classify_features_offl
 from map_image_check.ml_classifier import MapMlClassifier
 from map_image_check.image_store import (
     ImageStore,
+    LLM_FILTER_NO,
+    LLM_FILTER_UNKNOWN,
+    LLM_FILTER_YES,
+    StoredImageRecord,
     encode_image_for_storage,
+    list_records_needing_llm_analysis,
+    matches_llm_topographic_filter,
     parse_feature_summary,
+    record_has_llm_analysis,
 )
 
 
@@ -120,6 +127,140 @@ class HybridPipelineTests(unittest.TestCase):
             del store
             try:
                 db_path.unlink()
+            except OSError:
+                pass
+
+
+    def test_matches_llm_topographic_filter(self) -> None:
+        self.assertTrue(
+            matches_llm_topographic_filter(True, filter_mode=LLM_FILTER_YES)
+        )
+        self.assertFalse(
+            matches_llm_topographic_filter(False, filter_mode=LLM_FILTER_YES)
+        )
+        self.assertTrue(
+            matches_llm_topographic_filter(None, filter_mode=LLM_FILTER_UNKNOWN)
+        )
+        self.assertFalse(
+            matches_llm_topographic_filter(True, filter_mode=LLM_FILTER_NO)
+        )
+
+    def test_record_has_llm_analysis(self) -> None:
+        analyzed = StoredImageRecord(
+            image_id=1,
+            source_path="/tmp/a.png",
+            source_host=None,
+            scan_scope="test",
+            file_size=1,
+            width=1,
+            height=1,
+            sha256="abc",
+            is_map=True,
+            detector_version="v1",
+            score=0.5,
+            threshold=0.4,
+            feature_summary_json="{}",
+            llm_status="completed",
+            llm_model_name="m",
+            llm_prompt_version="p",
+            llm_analysis_text="text",
+            llm_structured_json="{}",
+            llm_is_topographic_map=True,
+        )
+        pending = StoredImageRecord(
+            image_id=2,
+            source_path="/tmp/b.png",
+            source_host=None,
+            scan_scope="test",
+            file_size=1,
+            width=1,
+            height=1,
+            sha256="def",
+            is_map=True,
+            detector_version="v1",
+            score=0.5,
+            threshold=0.4,
+            feature_summary_json="{}",
+            llm_status=None,
+            llm_model_name=None,
+            llm_prompt_version=None,
+            llm_analysis_text=None,
+            llm_structured_json=None,
+            llm_is_topographic_map=None,
+        )
+        gray = StoredImageRecord(
+            image_id=3,
+            source_path="/tmp/c.png",
+            source_host=None,
+            scan_scope="test",
+            file_size=1,
+            width=1,
+            height=1,
+            sha256="ghi",
+            is_map=True,
+            detector_version="v1",
+            score=0.5,
+            threshold=0.4,
+            feature_summary_json="{}",
+            llm_status="gray_zone",
+            llm_model_name="m",
+            llm_prompt_version="p",
+            llm_analysis_text="text",
+            llm_structured_json="{}",
+            llm_is_topographic_map=True,
+        )
+        self.assertTrue(record_has_llm_analysis(analyzed))
+        self.assertTrue(record_has_llm_analysis(gray))
+        self.assertFalse(record_has_llm_analysis(pending))
+        self.assertEqual(
+            list_records_needing_llm_analysis([analyzed, pending, gray]),
+            [pending],
+        )
+
+    def test_update_llm_result_persists_analysis(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        tmp.close()
+        db_path = Path(tmp.name)
+        store = ImageStore(db_path)
+        try:
+            img = np.zeros((200, 300, 3), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", img)
+            self.assertTrue(ok)
+            png_path = Path(tmp.name + ".png")
+            png_path.write_bytes(encoded.tobytes())
+            saved = store.save_detected_image(
+                png_path,
+                scan_scope="test",
+                heuristic={
+                    "is_map": True,
+                    "score": 0.7,
+                    "threshold": 0.45,
+                    "detector_version": "test",
+                    "features": _sample_features(0.5),
+                },
+            )
+            store.update_llm_result(
+                saved.record.image_id,
+                status="completed",
+                model_name="qwen2.5vl:7b",
+                prompt_version="map-review-v2",
+                analysis_text="1. Тип\nКарта",
+                structured_json={"api": "chat"},
+                is_topographic_map=True,
+            )
+            record = store.get_image_record(saved.record.image_id)
+            self.assertEqual(record.llm_status, "completed")
+            self.assertEqual(record.llm_model_name, "qwen2.5vl:7b")
+            self.assertEqual(record.llm_analysis_text, "1. Тип\nКарта")
+            self.assertTrue(record.llm_is_topographic_map)
+        finally:
+            del store
+            try:
+                db_path.unlink()
+            except OSError:
+                pass
+            try:
+                png_path.unlink()
             except OSError:
                 pass
 

@@ -15,15 +15,16 @@ import numpy as np
 
 from .image_store import StoredImageRecord
 
-DEFAULT_LOCAL_MODEL = "llama3.2-vision"
-DEFAULT_PROMPT_VERSION = "map-review-v1"
-DEFAULT_YES_NO_PROMPT_VERSION = "map-yes-no-v1"
+DEFAULT_LOCAL_MODEL = "qwen2.5vl:7b"
+DEFAULT_PROMPT_VERSION = "map-review-v2"
+DEFAULT_YES_NO_PROMPT_VERSION = "map-yes-no-v2"
 DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_ENDPOINT = f"{DEFAULT_OLLAMA_BASE}/api/generate"
 DEFAULT_LLM_GRAY_TIMEOUT = 60
 DEFAULT_LLM_ANALYSIS_TIMEOUT = 180
-DEFAULT_LLM_MAX_LONG_SIDE = 1536
+DEFAULT_LLM_MAX_LONG_SIDE = 1024
 DEFAULT_LLM_JPEG_QUALITY = 85
+DEFAULT_LLM_NUM_CTX = 8192
 
 
 def normalize_ollama_base_url(base_url: str) -> str:
@@ -50,8 +51,9 @@ def build_chat_payload(
     content: str,
     image_bytes: bytes,
     stream: bool = False,
+    num_ctx: int = DEFAULT_LLM_NUM_CTX,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": model_name,
         "messages": [
             {
@@ -62,6 +64,9 @@ def build_chat_payload(
         ],
         "stream": stream,
     }
+    if num_ctx > 0:
+        payload["options"] = {"num_ctx": int(num_ctx)}
+    return payload
 
 
 def extract_chat_response_text(data: dict[str, Any]) -> str:
@@ -94,6 +99,12 @@ def format_ollama_error(exc: BaseException, *, base_url: str = DEFAULT_OLLAMA_BA
                 return (
                     f"Модель не установлена в Ollama: {api_message}. "
                     f"Выполните: ollama pull <имя-модели>"
+                )
+            if "exceed_context_size" in lowered or "exceeds the available context" in lowered:
+                return (
+                    "Запрос с изображением превышает размер контекста модели (num_ctx). "
+                    "Увеличьте context length до 8192 или выше "
+                    "(Open WebUI: настройки чата → Advanced Params → Context Length)."
                 )
             return f"Ollama вернула ошибку HTTP {exc.code}: {api_message}"
         return f"Ollama вернула ошибку HTTP {exc.code} ({normalized})."
@@ -263,21 +274,23 @@ def prepare_image_bytes_for_llm(
 
 def build_analysis_prompt(record: StoredImageRecord) -> str:
     return (
-        "You are analyzing a potentially map-like image.\n"
-        "Describe what the image contains in detail. Decide whether it is a real terrain or topographic map, "
-        "a poster, a screenshot, a logo, a photo, a document illustration, or something else.\n"
-        "Return concise but useful analysis with these sections:\n"
-        "1. Type\n"
-        "2. Evidence\n"
-        "3. MapLikelihood\n"
-        "4. ImportantDetails\n\n"
-        f"Source path: {record.source_path}\n"
-        f"Scan scope: {record.scan_scope}\n"
-        f"Heuristic detector version: {record.detector_version}\n"
-        f"Heuristic detector is_map: {record.is_map}\n"
-        f"Heuristic score: {record.score}\n"
-        f"Heuristic threshold: {record.threshold}\n"
-        f"Heuristic features JSON: {record.feature_summary_json}\n"
+        "Вы анализируете изображение, которое может быть картой.\n"
+        "Подробно опишите, что изображено. Определите, является ли это реальной "
+        "топографической или terrain-картой, постером, скриншотом, логотипом, "
+        "фотографией, иллюстрацией в документе или чем-то другим.\n"
+        "Ответ дайте полностью на русском языке. Верните краткий, но полезный "
+        "анализ со следующими разделами:\n"
+        "1. Тип\n"
+        "2. Доказательства\n"
+        "3. ВероятностьКарты\n"
+        "4. ВажныеДетали\n\n"
+        f"Путь к файлу: {record.source_path}\n"
+        f"Область сканирования: {record.scan_scope}\n"
+        f"Версия эвристического детектора: {record.detector_version}\n"
+        f"Эвристика is_map: {record.is_map}\n"
+        f"Эвристический score: {record.score}\n"
+        f"Порог эвристики: {record.threshold}\n"
+        f"Признаки эвристики (JSON): {record.feature_summary_json}\n"
     )
 
 
@@ -309,6 +322,50 @@ def analyze_image_with_local_llm(
     }
 
 
+def _parse_yes_no_response(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        raise RuntimeError("LLM вернула пустой ответ.")
+    if normalized.startswith("да") or normalized.startswith("yes") or normalized == "y":
+        return True
+    if normalized.startswith("нет") or normalized.startswith("no") or normalized == "n":
+        return False
+    words = normalized.split()
+    if words and words[0] in ("да", "yes"):
+        return True
+    if words and words[0] in ("нет", "no"):
+        return False
+    return "да" in words and "нет" not in words[:1]
+
+
+def classify_map_yes_no_with_response(
+    *,
+    image_bytes: bytes,
+    model_name: str = DEFAULT_LOCAL_MODEL,
+    base_url: str = DEFAULT_OLLAMA_BASE,
+    endpoint: str | None = None,
+    prompt_version: str = DEFAULT_YES_NO_PROMPT_VERSION,
+    timeout: int = DEFAULT_LLM_GRAY_TIMEOUT,
+) -> tuple[bool, str]:
+    """Fast yes/no with raw model response text."""
+    del endpoint, prompt_version  # legacy aliases
+    prompt = (
+        "Посмотрите на изображение. Это настоящая топографическая карта, terrain-карта "
+        "или военно-топографическая схема с линиями рельефа и контурами?\n"
+        "Ответьте ровно одним словом на русском: да или нет.\n"
+        "Не объясняйте."
+    )
+    prepared = prepare_image_bytes_for_llm(image_bytes)
+    text = ollama_chat(
+        base_url=base_url,
+        model_name=model_name,
+        content=prompt,
+        image_bytes=prepared,
+        timeout=timeout,
+    )
+    return _parse_yes_no_response(text), text.strip()
+
+
 def classify_map_yes_no(
     *,
     image_bytes: bytes,
@@ -319,23 +376,44 @@ def classify_map_yes_no(
     timeout: int = DEFAULT_LLM_GRAY_TIMEOUT,
 ) -> bool:
     """Fast yes/no: is this a topographic or terrain map?"""
-    del endpoint  # legacy alias; base_url is used instead
-    prompt = (
-        "Look at this image. Is it a real topographic map, terrain map, "
-        "or military/topographic chart with elevation/contour lines?\n"
-        "Answer with exactly one word: yes or no.\n"
-        "Do not explain."
-    )
-    prepared = prepare_image_bytes_for_llm(image_bytes)
-    text = ollama_chat(
-        base_url=base_url,
+    verdict, _response = classify_map_yes_no_with_response(
+        image_bytes=image_bytes,
         model_name=model_name,
-        content=prompt,
-        image_bytes=prepared,
+        base_url=base_url,
+        endpoint=endpoint,
+        prompt_version=prompt_version,
         timeout=timeout,
-    ).lower()
-    if text.startswith("yes") or text == "y":
-        return True
-    if text.startswith("no") or text == "n":
-        return False
-    return "yes" in text.split() and "no" not in text.split()[:1]
+    )
+    return verdict
+
+
+def build_gray_zone_llm_result(
+    *,
+    model_name: str,
+    llm_verdict: bool,
+    llm_response_text: str | None,
+    ml_score: float | None,
+    heuristic_score: float,
+) -> dict[str, Any]:
+    verdict_label = "да, это карта" if llm_verdict else "нет, это не карта"
+    response = (llm_response_text or verdict_label).strip()
+    ml_part = f"{ml_score:.2f}" if ml_score is not None else "—"
+    return {
+        "status": "gray_zone",
+        "model_name": model_name,
+        "prompt_version": DEFAULT_YES_NO_PROMPT_VERSION,
+        "is_topographic_map": llm_verdict,
+        "analysis_text": (
+            f"Быстрая проверка LLM (серая зона ML): {verdict_label}.\n"
+            f"Ответ модели: {response}\n"
+            f"ML score: {ml_part}\n"
+            f"Эвристика: {heuristic_score:.2f}"
+        ),
+        "structured_json": {
+            "kind": "gray_zone",
+            "llm_verdict": llm_verdict,
+            "llm_response_text": llm_response_text,
+            "ml_score": ml_score,
+            "heuristic_score": heuristic_score,
+        },
+    }

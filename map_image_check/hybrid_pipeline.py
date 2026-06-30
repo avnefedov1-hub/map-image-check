@@ -41,6 +41,7 @@ class HybridDecision:
     detector_version: str
     threshold: float
     llm_verdict: bool | None = None
+    llm_response_text: str | None = None
 
     def as_heuristic_payload(self) -> dict[str, Any]:
         return {
@@ -52,6 +53,7 @@ class HybridDecision:
             "ml_score": self.ml_score,
             "decision_source": self.decision_source,
             "llm_verdict": self.llm_verdict,
+            "llm_response_text": self.llm_response_text,
         }
 
 
@@ -109,7 +111,13 @@ def classify_image_path(
             if config.use_llm_gray_zone and llm_classify is not None:
                 try:
                     image_bytes = Path(path).read_bytes()
-                    llm_ok = bool(llm_classify(image_bytes))
+                    llm_result = llm_classify(image_bytes)
+                    if isinstance(llm_result, tuple):
+                        llm_ok = bool(llm_result[0])
+                        llm_text = str(llm_result[1]) if len(llm_result) > 1 else None
+                    else:
+                        llm_ok = bool(llm_result)
+                        llm_text = None
                     return HybridDecision(
                         is_map=llm_ok,
                         heuristic_score=heuristic_score,
@@ -119,6 +127,7 @@ def classify_image_path(
                         detector_version=HYBRID_DETECTOR_VERSION,
                         threshold=threshold,
                         llm_verdict=llm_ok,
+                        llm_response_text=llm_text,
                     )
                 except OSError:
                     pass

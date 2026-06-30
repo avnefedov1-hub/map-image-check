@@ -121,6 +121,7 @@ class StoredImageRecord:
     llm_prompt_version: str | None
     llm_analysis_text: str | None
     llm_structured_json: str | None
+    llm_is_topographic_map: bool | None
 
 
 @dataclass(slots=True)
@@ -232,6 +233,30 @@ class ImageStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_images_source_host ON images(source_host)"
             )
+            self._migrate_db(conn)
+
+    def _migrate_db(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(llm_results)").fetchall()
+        }
+        if "is_topographic_map" not in columns:
+            conn.execute(
+                "ALTER TABLE llm_results ADD COLUMN is_topographic_map INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_is_topographic_map "
+            "ON llm_results(is_topographic_map)"
+        )
+        conn.execute(
+            """
+            UPDATE llm_results
+            SET is_topographic_map = CAST(json_extract(structured_json, '$.llm_verdict') AS INTEGER)
+            WHERE is_topographic_map IS NULL
+              AND structured_json IS NOT NULL
+              AND json_type(structured_json, '$.llm_verdict') IN ('true', 'false', 'integer')
+            """
+        )
 
     def find_existing_image_id(
         self,
@@ -379,6 +404,7 @@ class ImageStore:
         prompt_version: str | None,
         analysis_text: str | None,
         structured_json: str | dict[str, Any] | None,
+        is_topographic_map: bool | None = None,
     ) -> None:
         now = _utc_now()
         if structured_json is None:
@@ -389,20 +415,29 @@ class ImageStore:
             structured_value = json.dumps(
                 structured_json, ensure_ascii=False, sort_keys=True
             )
+        topo_value = (
+            None if is_topographic_map is None else int(bool(is_topographic_map))
+        )
 
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO llm_results (
                     image_id, status, model_name, prompt_version,
-                    analysis_text, structured_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    analysis_text, structured_json, is_topographic_map,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_id) DO UPDATE SET
                     status = excluded.status,
                     model_name = excluded.model_name,
                     prompt_version = excluded.prompt_version,
                     analysis_text = excluded.analysis_text,
                     structured_json = excluded.structured_json,
+                    is_topographic_map = CASE
+                        WHEN excluded.is_topographic_map IS NOT NULL
+                        THEN excluded.is_topographic_map
+                        ELSE llm_results.is_topographic_map
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -412,6 +447,7 @@ class ImageStore:
                     prompt_version,
                     analysis_text,
                     structured_value,
+                    topo_value,
                     now,
                     now,
                 ),
@@ -436,7 +472,8 @@ class ImageStore:
             lr.model_name AS llm_model_name,
             lr.prompt_version AS llm_prompt_version,
             lr.analysis_text AS llm_analysis_text,
-            lr.structured_json AS llm_structured_json
+            lr.structured_json AS llm_structured_json,
+            lr.is_topographic_map AS llm_is_topographic_map
         FROM images i
         JOIN heuristic_results hr ON hr.image_id = i.id
         LEFT JOIN llm_results lr ON lr.image_id = i.id
@@ -463,6 +500,11 @@ class ImageStore:
             llm_prompt_version=row["llm_prompt_version"],
             llm_analysis_text=row["llm_analysis_text"],
             llm_structured_json=row["llm_structured_json"],
+            llm_is_topographic_map=(
+                None
+                if row["llm_is_topographic_map"] is None
+                else bool(row["llm_is_topographic_map"])
+            ),
         )
 
     def get_image_record(self, image_id: int) -> StoredImageRecord:
@@ -698,9 +740,31 @@ ML_FILTER_ALL = "all"
 ML_FILTER_GT90 = "gt90"
 ML_FILTER_RANGE_80_90 = "80_90"
 
+LLM_FILTER_ALL = "all"
+LLM_FILTER_YES = "topo_yes"
+LLM_FILTER_NO = "topo_no"
+LLM_FILTER_UNKNOWN = "topo_unknown"
+
+LLM_ANALYZED_STATUSES = frozenset({"completed", "gray_zone"})
+
 
 def record_ml_score(record: StoredImageRecord) -> float | None:
     return parse_feature_summary(record.feature_summary_json).get("ml_score")
+
+
+def record_llm_is_topographic_map(record: StoredImageRecord) -> bool | None:
+    return record.llm_is_topographic_map
+
+
+def record_has_llm_analysis(record: StoredImageRecord) -> bool:
+    """True if LLM already produced a stored verdict (full or gray-zone)."""
+    return bool(record.llm_status in LLM_ANALYZED_STATUSES)
+
+
+def list_records_needing_llm_analysis(
+    records: list[StoredImageRecord],
+) -> list[StoredImageRecord]:
+    return [record for record in records if not record_has_llm_analysis(record)]
 
 
 def matches_ml_score_filter(
@@ -720,9 +784,25 @@ def matches_ml_score_filter(
     return True
 
 
+def matches_llm_topographic_filter(
+    llm_is_topographic_map: bool | None,
+    *,
+    filter_mode: str,
+) -> bool:
+    if filter_mode in ("", LLM_FILTER_ALL):
+        return True
+    if filter_mode == LLM_FILTER_YES:
+        return llm_is_topographic_map is True
+    if filter_mode == LLM_FILTER_NO:
+        return llm_is_topographic_map is False
+    if filter_mode == LLM_FILTER_UNKNOWN:
+        return llm_is_topographic_map is None
+    return True
+
+
 def _build_feature_summary(heuristic: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {"features": heuristic.get("features", {})}
-    for key in ("ml_score", "decision_source", "llm_verdict"):
+    for key in ("ml_score", "decision_source", "llm_verdict", "llm_response_text"):
         value = heuristic.get(key)
         if value is not None:
             payload[key] = value
